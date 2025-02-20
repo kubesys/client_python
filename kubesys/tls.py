@@ -19,7 +19,8 @@ import yaml
 from base64 import b64decode
 
 __author__ = ('Tian Yu <yutian20@otcaix.iscas.ac.cn>',
-              'Heng Wu <wuheng@iscas.ac.cn>')
+              'Heng Wu <wuheng@iscas.ac.cn>',
+              'Jiexin Liu <liujiexin@otcaix.iscas.ac.cn>')
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -52,8 +53,9 @@ def tlsPaths(config):
 
 def tlsFile(name, content):
     path = os.getcwd() + "/" + name
-    if not os.path.exists(path):
-        f = open(path, "w")
-        f.write(str(content, 'UTF-8'))
-        f.close()
+    if os.path.exists(path):
+        os.remove(path)
+    f = open(path, "w")
+    f.write(str(content, 'UTF-8'))
+    f.close()
     return path
