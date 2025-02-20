@@ -18,7 +18,8 @@ from kubesys.common import getLastIndex
 from kubesys.exceptions import KindException
 
 __author__ = ('Tian Yu <yutian20@otcaix.iscas.ac.cn>',
-              'Heng Wu <wuheng@iscas.ac.cn>')
+              'Heng Wu <wuheng@iscas.ac.cn>',
+              'Jiexin Liu <liujiexin@otcaix.iscas.ac.cn>')
 
 
 class KubernetesAnalyzer:
