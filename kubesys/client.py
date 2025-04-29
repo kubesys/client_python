@@ -14,7 +14,7 @@
  * limitations under the License.
  '''
 import sys
-from typing import Union
+from typing import Union, Dict, List, Optional
 from kubesys.common import getLastIndex, dictToJsonString, jsonStringToBytes, getParams, formatURL
 from kubesys.http_request import createRequest,doCreateRequest
 from kubesys.analyzer import KubernetesAnalyzer
@@ -23,8 +23,16 @@ import requests
 import json
 from kubesys.common import jsonBytesToDict
 import threading
+from kubesys.logger import logger, info, error, debug, warning
+from kubesys import http_request
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from urllib.parse import urljoin
+from functools import lru_cache
+import time
 
-from kubesys.tls import readConfig
+from kubesys.tls import readConfig, recreate_tls_files
 from kubesys.watcher import KubernetesWatcher
 
 __author__ = ('Tian Yu <yutian20@otcaix.iscas.ac.cn>',
@@ -46,29 +54,67 @@ class KubernetesClient():
     #             url = account_info_dict[account_json["host_label"]]["URL"]
     #             token = account_info_dict[account_json["host_label"]]["Token"]
 
-    def __init__(self, url=None, token=None, analyzer=None,
-                 config=None, relearning=True) -> None:
-        # if not url and not token:
-        self.config = config
+    def __init__(self, url=None, token=None, config=None, relearning=True) -> None:
+        # 初始化缓存相关属性
+        self._version_cache = {}
+        self._last_cache_update = 0
+        self._cache_ttl = 300  # 缓存有效期5分钟
+        
+        try:
+            if config is not None:
+                recreate_tls_files(config)
+            else:
+                recreate_tls_files('/etc/kubernetes/admin.conf')
+        except Exception as e:
+            print(f"recreate_tls_files error: {e}")
 
-        if self.config is None:
-            if url is None or token is None:
-                raise HTTPError('missing url or token')
-            self.url = url.rstrip("/")
-            self.token = token
-        else:
-            self.config = readConfig(config)
-            self.url = self.config.server
-            self.token = None
+        try:
+            self.config = config
 
-        if analyzer:
-            self.analyzer = analyzer
-        else:
+            if self.config is None:
+                if url is None or token is None:
+                    raise HTTPError('missing url or token')
+                self.url = url.rstrip("/")
+                self.token = token
+            else:
+                self.config = readConfig(config)
+                self.url = self.config.server
+                self.token = None
+
             self.analyzer = KubernetesAnalyzer()
+            info("Initializing Kubernetes client...")
             self.analyzer.learning(url=self.url, token=self.token, config=self.config)
 
-        if relearning and self.analyzer:
-            self.Init()
+            if relearning and self.analyzer:
+                self.Init()
+
+            # 初始化logger
+            self.logger = logging.getLogger(__name__)
+            
+            # 初始化session
+            self.session = requests.Session()
+            
+            # 配置重试策略
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[500, 502, 503, 504]
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
+            
+            # 初始化headers
+            self.headers = {
+                "Accept": "*/*",
+                "Accept-Encoding": "gzip, deflate, br",
+            }
+            if self.token:
+                self.headers["Authorization"] = "Bearer " + self.token
+                
+        except Exception as e:
+            error(f"Failed to initialize Kubernetes client: {str(e)}")
+            raise
 
     def Init(self) -> None:
         self.analyzer.learning(url=self.url, token=self.token, config=self.config)
@@ -86,107 +132,258 @@ class KubernetesClient():
         else:
             return apiVersion[:index] + "." + kind
 
-    def createResource(self, jsonStr, **kwargs) -> dict:
-        jsonObj = jsonStr
-        if type(jsonObj) is str:
-            jsonObj = json.loads(jsonObj)
-        elif type(jsonObj) is dict:
-            jsonStr=dictToJsonString(jsonStr)
+    def _get_api_resources(self) -> Dict[str, List[Dict]]:
+        """
+        Get available API resources and their preferred versions
+        Returns: Dict[resource_kind, List[{group, version, namespaced}]]
+        """
+        try:
+            current_time = time.time()
+            
+            # 检查缓存是否有效
+            if (hasattr(self, '_last_cache_update') and 
+                hasattr(self, '_version_cache') and 
+                current_time - self._last_cache_update < self._cache_ttl and 
+                self._version_cache):
+                return self._version_cache
 
-        kind = self.getRealKind(str(jsonObj["kind"]), str(jsonObj["apiVersion"]))
+            resources = {}
+            
+            # Get core API resources
+            core_api = createRequest(
+                url=urljoin(self.url, '/api/v1'),
+                token=self.token,
+                method='GET',
+                config=self.config
+            )
+            
+            if core_api and 'resources' in core_api:
+                for resource in core_api['resources']:
+                    if '/' not in resource.get('name', ''):  # Skip subresources
+                        kind = resource.get('kind')
+                        if kind:
+                            if kind not in resources:
+                                resources[kind] = []
+                            resources[kind].append({
+                                'group': '',
+                                'version': 'v1',
+                                'namespaced': resource.get('namespaced', True)
+                            })
 
-        namespace = ""
-        if "namespace" in jsonObj["metadata"].keys():
-            namespace = str(jsonObj["metadata"]["namespace"])
+            # Get API groups
+            groups_response = createRequest(
+                url=urljoin(self.url, '/apis'),
+                token=self.token,
+                method='GET',
+                config=self.config
+            )
 
-        url = self.analyzer.FullKindToApiPrefixDict[kind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[kind], namespace)
-        url += self.analyzer.FullKindToNameDict[kind]
-        return createRequest(url=url, token=self.token, method="POST", body=jsonStr,keep_json=False, config=self.config, **kwargs)
+            if groups_response and 'groups' in groups_response:
+                for group in groups_response['groups']:
+                    group_name = group.get('name', '')
+                    preferred_version = group.get('preferredVersion', {}).get('version')
+                    
+                    if not preferred_version:
+                        continue
 
-    def updateResource(self, jsonStr:Union[str,dict], **kwargs) -> dict:
-        jsonObj = jsonStr
-        if type(jsonObj) is str:
-            jsonObj = json.loads(jsonObj)
-        elif type(jsonObj) is dict:
-            jsonStr=dictToJsonString(jsonStr)
+                    # Get resources for this API group
+                    group_resources = createRequest(
+                        url=urljoin(self.url, f'/apis/{group_name}/{preferred_version}'),
+                        token=self.token,
+                        method='GET',
+                        config=self.config
+                    )
 
-        kind = self.getRealKind(str(jsonObj["kind"]), str(jsonObj["apiVersion"]))
+                    if group_resources and 'resources' in group_resources:
+                        for resource in group_resources['resources']:
+                            if '/' not in resource.get('name', ''):  # Skip subresources
+                                kind = resource.get('kind')
+                                if kind:
+                                    if kind not in resources:
+                                        resources[kind] = []
+                                    resources[kind].append({
+                                        'group': group_name,
+                                        'version': preferred_version,
+                                        'namespaced': resource.get('namespaced', True)
+                                    })
 
-        namespace = ""
-        if "namespace" in jsonObj["metadata"].keys():
-            namespace = str(jsonObj["metadata"]["namespace"])
+            # Cache the results
+            self._version_cache = resources
+            self._last_cache_update = current_time
+            return resources
+            
+        except Exception as e:
+            error(f"Failed to get API resources: {str(e)}")
+            # 如果出错，确保返回空字典而不是None
+            return {}
 
-        url = self.analyzer.FullKindToApiPrefixDict[kind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[kind], namespace)
-        url += self.analyzer.FullKindToNameDict[kind] + "/" + jsonObj["metadata"]["name"]
+    def _get_resource_info(self, kind: str) -> Dict:
+        """
+        Get the preferred API version and other info for a given resource kind
+        """
+        resources = self._get_api_resources()
+        if kind not in resources:
+            raise ValueError(f"Resource kind '{kind}' not found in the cluster")
 
-        return createRequest(url=url, token=self.token, method="PUT", body=jsonStr, keep_json=False,config=self.config, **kwargs)
+        # Use the first available version (which is typically the preferred version)
+        return resources[kind][0]
 
-    def partiallyUpdateResource(self, jsonStr:Union[str,dict], **kwargs) -> dict:
-        jsonObj = jsonStr
-        if type(jsonObj) is str:
-            jsonObj = json.loads(jsonObj)
-        elif type(jsonObj) is dict:
-            jsonStr=dictToJsonString(jsonStr)
+    def _ensure_api_version(self, resource: Union[dict, str]) -> dict:
+        """
+        Ensure the resource has the correct API version
+        """
+        if isinstance(resource, str):
+            resource = json.loads(resource)
+        
+        if not isinstance(resource, dict):
+            raise ValueError("Resource must be a dictionary")
+        
+        if 'kind' not in resource:
+            raise ValueError("Resource must have a 'kind' field")
+        
+        kind = resource['kind']
+        if 'apiVersion' not in resource:
+            resource_info = self._get_resource_info(kind)
+            group = resource_info['group']
+            version = resource_info['version']
+            resource['apiVersion'] = f"{group}/{version}" if group else version
+        
+        return resource
 
-        kind = self.getRealKind(str(jsonObj["kind"]), str(jsonObj["apiVersion"]))
+    def _get_resource_url(self, resource: dict, name: str = None) -> str:
+        """
+        Get the appropriate URL for the resource
+        """
+        kind = resource['kind']
+        api_version = resource['apiVersion']
+        namespace = resource.get('metadata', {}).get('namespace', 'default')
+        
+        resource_info = self._get_resource_info(kind)
+        is_namespaced = resource_info['namespaced']
+        
+        if '/' in api_version:
+            group, version = api_version.split('/')
+            base_url = f"/apis/{group}/{version}"
+        else:
+            base_url = f"/api/{api_version}"
 
-        namespace = ""
-        if "namespace" in jsonObj["metadata"].keys():
-            namespace = str(jsonObj["metadata"]["namespace"])
+        resource_type = kind.lower() + 's'
+        
+        if is_namespaced:
+            url = f"{self.url}{base_url}/namespaces/{namespace}/{resource_type}"
+        else:
+            url = f"{self.url}{base_url}/{resource_type}"
+            
+        if name:
+            url = f"{url}/{name}"
+            
+        return url
 
-        url = self.analyzer.FullKindToApiPrefixDict[kind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[kind], namespace)
-        url += self.analyzer.FullKindToNameDict[kind] + "/" + jsonObj["metadata"]["name"]
+    def createResource(self, resource: Union[dict, str], **kwargs):
+        """Create a Kubernetes resource with automatic API version detection"""
+        try:
+            resource = self._ensure_api_version(resource)
+            url = self._get_resource_url(resource)
+            
+            return createRequest(
+                url=url,
+                token=self.token,
+                method="POST",
+                body=json.dumps(resource),
+                config=self.config,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"Failed to create resource: {str(e)}")
 
-        return createRequest(url=url, token=self.token, method="PATCH", body=jsonStr, keep_json=False,config=self.config, **kwargs)
+    def updateResource(self, resource: Union[dict, str], **kwargs):
+        """Update a Kubernetes resource with automatic API version detection"""
+        try:
+            resource = self._ensure_api_version(resource)
+            name = resource.get('metadata', {}).get('name')
+            
+            if not name:
+                raise ValueError("Resource must have a name")
+                
+            url = self._get_resource_url(resource, name)
+            
+            return createRequest(
+                url=url,
+                token=self.token,
+                method="PUT",
+                body=json.dumps(resource),
+                config=self.config,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"Failed to update resource: {str(e)}")
 
-    # def checkAndReturnRealKind(self, kind, mapper):
-    #     index = kind.find(".")
-    #     if index < 0:
-    #         if not mapper.get(kind) or len(mapper.get(kind)) == 0:
-    #             raise KindException(f"Invalid kind {kind}")
-    #         if len(mapper[kind]) == 1:
-    #             return mapper[kind][0]
-    #
-    #         # elif len(mapper[kind]) == 0:
-    #         #     raise Exception(f"Invalid kind {kind}")
-    #
-    #         else:
-    #             value = ""
-    #             for s in mapper[kind]:
-    #                 value += "," + s
-    #
-    #             raise KindException("please use fullKind: " + value[1:])
-    #
-    #     return kind
+    def deleteResource(self, kind: str, name: str, namespace: str = None, **kwargs):
+        """Delete a Kubernetes resource with automatic API version detection"""
+        try:
+            resource_info = self._get_resource_info(kind)
+            group = resource_info['group']
+            version = resource_info['version']
+            api_version = f"{group}/{version}" if group else version
+            
+            resource = {
+                'kind': kind,
+                'apiVersion': api_version,
+                'metadata': {
+                    'name': name,
+                    'namespace': namespace
+                }
+            }
+            
+            url = self._get_resource_url(resource, name)
+            
+            return createRequest(
+                url=url,
+                token=self.token,
+                method="DELETE",
+                config=self.config,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"Failed to delete resource: {str(e)}")
 
-    def deleteResource(self, kind, namespace, name, **kwargs) -> dict:
+    def getResource(self, kind, namespace='default', name='', pretty=False):
+        try:
+            fullKind = self.analyzer.checkAndReturnRealKind(kind)
+            url = self.url + self.analyzer.fullkind_to_api[fullKind] + "/"
+            is_namespaced = self.analyzer.resources[fullKind].get('namespaced', False)
+            url += self.getNamespace(is_namespaced, namespace)
+            resource_name = self.analyzer.resources[fullKind]['name']
+            if "/" in resource_name:
+                resource_name = resource_name.split("/")[0]
+            url += resource_name
+            if name:
+                url = f"{url}/{name}"
+            params = {}
+            if pretty:
+                params['pretty'] = 'true'
+            debug(f"Requesting URL: {url}")  # 调试日志
+            return http_request.createRequest(
+                url=url,
+                token=self.token,
+                method="GET",
+                config=self.config,
+                **params
+            )
+        except Exception as e:
+            error(f"Failed to get resource {kind}/{name}: {str(e)}")
+            raise
+
+    def listResources(self, kind, namespace=None, **kwargs) -> dict:
         fullKind = self.analyzer.checkAndReturnRealKind(kind)
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
-        url += self.analyzer.FullKindToNameDict[fullKind] + "/" + name
-
-        return createRequest(url=url, token=self.token, method="DELETE", keep_json=False,config=self.config, **kwargs)
-
-    def getResource(self, kind, name, namespace="", **kwargs) -> dict:
-        fullKind = self.analyzer.checkAndReturnRealKind(kind)
-
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
-        url += self.analyzer.FullKindToNameDict[fullKind] + "/" + name
-
-        return createRequest(url=url, token=self.token, method="GET", keep_json=False, config=self.config,**kwargs)
-
-    def listResources(self, kind, namespace="", **kwargs) -> dict:
-        fullKind = self.analyzer.checkAndReturnRealKind(kind)
-
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
-        url += self.analyzer.FullKindToNameDict[fullKind]
-
-        return createRequest(url=url, token=self.token, method="GET", keep_json=False, config=self.config,**kwargs)
+        url = self.url + self.analyzer.fullkind_to_api[fullKind] + "/"
+        is_namespaced = self.analyzer.resources[fullKind].get('namespaced', False)
+        url += self.getNamespace(is_namespaced, namespace)
+        resource_name = self.analyzer.resources[fullKind]['name']
+        if "/" in resource_name:
+            resource_name = resource_name.split("/")[0]
+        url += resource_name
+        return createRequest(url=url, token=self.token, method="GET", keep_json=False, config=self.config, **kwargs)
 
     def bindResource(self, pod, host, **kwargs) -> dict:
         jsonObj = {}
@@ -207,9 +404,10 @@ class KubernetesClient():
         kind = self.getRealKind(pod["kind"], pod["apiVersion"])
         namespace = pod["metadata"]["namespace"]
 
-        url = self.analyzer.FullKindToApiPrefixDict[kind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[kind], namespace)
-        url += self.analyzer.FullKindToNameDict[kind] + "/"
+        url = self.url + self.analyzer.fullkind_to_api[kind] + "/"
+        is_namespaced = self.analyzer.resources[kind].get('namespaced', False)
+        url += self.getNamespace(is_namespaced, namespace)
+        url += self.analyzer.resources[kind]['name'] + "/"
         url += pod["metadata"]["name"] + "/binding"
 
         return createRequest(url=url, token=self.token, method="POST", data=jsonObj, keep_json=False, config=self.config,**kwargs)
@@ -221,12 +419,16 @@ class KubernetesClient():
         '''
         fullKind = self.analyzer.checkAndReturnRealKind(kind)
 
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind]+"/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
+        api_prefix = self.analyzer.fullkind_to_api[fullKind]
+        plural = self.analyzer.fullkind_to_plural[fullKind]
+        is_namespaced = self.analyzer.resources[fullKind].get('namespaced', False)
+        url = self.url + api_prefix + "/"
+        if is_namespaced and namespace:
+            url += f"namespaces/{namespace}/"
+        url += plural
         if name:
-            url += self.analyzer.FullKindToNameDict[fullKind] + "/" + name
-        else:
-            url += self.analyzer.FullKindToNameDict[fullKind]
+            url += "/" + name
+
         thread_t = threading.Thread(target=KubernetesClient.watching,
                                     args=(url, self.token, self.config, watcherhandler, kwargs,),
                                     name=thread_name, daemon=is_daemon)
@@ -235,7 +437,6 @@ class KubernetesClient():
                                     name=name, url=url, **kwargs)
         KubernetesClient.watcher_threads[thread_t.getName()] = watcher
         watcher.run()
-
         return watcher
 
     def watchResources(self, kind, namespace, watcherhandler, thread_name=None, is_daemon=True,
@@ -244,7 +445,8 @@ class KubernetesClient():
         if is_daemon is True, when the main thread leave, this thead will leave automatically.
         '''
         return self.watchResource(kind, namespace, watcherhandler, name=None, thread_name=thread_name,
-                                  isDaemon=is_daemon, **kwargs)
+                                  is_daemon=is_daemon, **kwargs)
+            
 
     def watchResourceBase(self, kind, namespace, handlerFunction, name=None, thread_name=None, is_daemon=True,
                           **kwargs) -> KubernetesWatcher:
@@ -253,12 +455,12 @@ class KubernetesClient():
         '''
         fullKind = self.analyzer.checkAndReturnRealKind(kind)
 
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind] + "/watch/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
+        url = self.analyzer.fullkind_to_api[fullKind] + "/watch/"
+        url += self.getNamespace(self.analyzer.resources[fullKind].get('namespaced', False), namespace)
         if name:
-            url += self.analyzer.FullKindToNameDict[fullKind] + "/" + name
+            url += self.analyzer.fullkind_to_plural[fullKind] + "/" + name
         else:
-            url += self.analyzer.FullKindToNameDict[fullKind]
+            url += self.analyzer.fullkind_to_plural[fullKind]
 
         thread_t = threading.Thread(target=KubernetesClient.watchingBase,
                                     args=(url, self.token, handlerFunction, kwargs,), name=thread_name,
@@ -275,7 +477,7 @@ class KubernetesClient():
         if is_daemon is True, when the main thread leave, this thead will leave automatically.
         '''
         return self.watchResourceBase(kind, namespace, handlerFunction, name=None, thread_name=thread_name,
-                                      isDaemon=is_daemon, **kwargs)
+                                      is_daemon=is_daemon, **kwargs)
 
     @staticmethod
     def watching(url, token, config, watchHandler, kwargs):
@@ -336,9 +538,10 @@ class KubernetesClient():
         if "namespace" in jsonObj["metadata"]:
             namespace = jsonObj["metadata"]["namespace"]
 
-        url = self.analyzer.FullKindToApiPrefixDict[kind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[kind], namespace)
-        url += self.analyzer.FullKindToNameDict[kind] + "/" + jsonObj["metadata"]["name"]
+        url = self.url + self.analyzer.fullkind_to_api[kind] + "/"
+        is_namespaced = self.analyzer.resources[kind].get('namespaced', False)
+        url += self.getNamespace(is_namespaced, namespace)
+        url += self.analyzer.resources[kind]['name'] + "/" + jsonObj["metadata"]["name"]
         url += "/status"
 
         return createRequest(url=url, token=self.token, method="PATCH", body=jsonStr, keep_json=False,config=self.config, **kwargs)
@@ -346,19 +549,24 @@ class KubernetesClient():
     def getResourceStatus(self,kind, name, namespace="", **kwargs)->dict:
         fullKind = self.analyzer.checkAndReturnRealKind(kind)
 
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
-        url += self.analyzer.FullKindToNameDict[fullKind] + "/" + name
-        url+="/status"
+        url = self.url + self.analyzer.fullkind_to_api[fullKind] + "/"
+        is_namespaced = self.analyzer.resources[fullKind].get('namespaced', False)
+        url += self.getNamespace(is_namespaced, namespace)
+        resource_name = self.analyzer.resources[fullKind]['name']
+        if "/" in resource_name:
+            resource_name = resource_name.split("/")[0]
+        url += resource_name + "/" + name
+        url += "/status"
 
         return createRequest(url=url, token=self.token, method="GET", keep_json=False, config=self.config, **kwargs)
 
     def listResourcesWithSelector(self, kind, namespace, tp,selects) -> dict:
         fullKind = self.analyzer.checkAndReturnRealKind(kind)
 
-        url = self.analyzer.FullKindToApiPrefixDict[fullKind] + "/"
-        url += self.getNamespace(self.analyzer.FullKindToNamespaceDict[fullKind], namespace)
-        url += self.analyzer.FullKindToNameDict[fullKind]
+        url = self.url + self.analyzer.fullkind_to_api[fullKind] + "/"
+        is_namespaced = self.analyzer.resources[fullKind].get('namespaced', False)
+        url += self.getNamespace(is_namespaced, namespace)
+        url += self.analyzer.resources[fullKind]['name']
         if tp=='label':
             url += "?labelSelector="
         elif tp=='field':
@@ -375,7 +583,7 @@ class KubernetesClient():
         return list(self.analyzer.KindToFullKindDict.keys())
 
     def getFullKinds(self) -> list:
-        return list(self.analyzer.FullKindToNameDict.keys())
+        return list(self.analyzer.resources.keys())
 
     def kind(self, fullkind) -> str:
         index = getLastIndex(fullkind, ".")
@@ -385,12 +593,12 @@ class KubernetesClient():
 
     def getKindDesc(self) -> dict:
         desc = {}
-        for fullKind in self.analyzer.FullKindToNameDict.keys():
+        for fullKind in self.analyzer.resources.keys():
             value = {}
-            value["apiVersion"] = self.analyzer.FullKindToVersionDict[fullKind]
+            value["apiVersion"] = self.analyzer.fullkind_to_api[fullKind]
             value["kind"] = self.kind(fullKind)
-            value["plural"] = self.analyzer.FullKindToNameDict[fullKind]
-            value["verbs"] = self.analyzer.FullKindToVerbsDict[fullKind]
+            value["plural"] = self.analyzer.resources[fullKind]['name']
+            value["verbs"] = self.analyzer.fullkind_to_verbs[fullKind]
             desc[fullKind] = value
 
         return desc
@@ -448,3 +656,199 @@ class KubernetesClient():
     @staticmethod
     def getWatcherThreadNames() -> list:
         return KubernetesClient.watcher_threads.keys()
+
+    def _watch(self):
+        """实现watch逻辑，包含重试机制和错误处理"""
+        retry_interval = 1  # 初始重试间隔1秒
+        
+        while self.running:
+            try:
+                info(f"[Watcher] {self.kind} watcher attempting to establish watch connection")
+                
+                # 调用client的watchResources方法并获取响应
+                response = self.client.watchResources(
+                    kind=self.kind,
+                    watcherhandler=self.handler,
+                    **self.kwargs
+                )
+                
+                # 重置重试间隔
+                retry_interval = 1
+                info(f"[Watcher] {self.kind} watcher connection established")
+                
+                # 处理响应流
+                for line in response.iter_lines():
+                    if not self.running:
+                        break
+                        
+                    if not line:
+                        continue
+                        
+                    try:
+                        # 解析事件数据
+                        event = json.loads(line.decode('utf-8'))
+                        
+                        # 更新指标
+                        self.metrics['last_event_time'] = time.time()
+                        self.metrics['event_count'] += 1
+                        
+                        # 记录事件信息
+                        event_type = event.get('type')
+                        obj = event.get('object', {})
+                        name = obj.get('metadata', {}).get('name')
+                        debug(f"[Watcher] {self.kind} received {event_type} event for {name}")
+                        debug(f"[Watcher] Event content: {json.dumps(event, indent=2)}")
+                        
+                        # 处理事件
+                        if self.handler:
+                            self.handler.handle(event)
+                        
+                    except json.JSONDecodeError as je:
+                        error(f"[Watcher] Failed to decode event: {str(je)}, raw data: {line}")
+                        continue
+                    except Exception as e:
+                        self.metrics['error_count'] += 1
+                        error(f"[Watcher] {self.kind} error processing event: {str(e)}")
+                        continue
+                
+            except Exception as e:
+                self.metrics['error_count'] += 1
+                self.metrics['reconnect_count'] += 1
+                error(f"[Watcher] {self.kind} watch connection failed: {str(e)}")
+                
+                # 指数退避重试
+                retry_interval = min(retry_interval * 2, self.max_retry_interval)
+                warning(f"[Watcher] {self.kind} retrying in {retry_interval} seconds")
+                
+                if self.running:
+                    time.sleep(retry_interval)
+                    continue
+                else:
+                    break
+        
+        info(f"[Watcher] {self.kind} watcher thread exiting")
+
+    def _verify_connection(self):
+        """验证与API server的连接"""
+        try:
+            # 尝试获取资源列表
+            self.client.getResources(kind=self.kind)
+            info(f"[Watcher] Successfully verified connection for {self.kind}")
+            return True
+        except Exception as e:
+            error(f"[Watcher] Connection verification failed for {self.kind}: {str(e)}")
+            return False
+
+    def start(self):
+        if self.running:
+            warning(f"[Watcher] {self.kind} watcher is already running")
+            return
+        
+        # 先验证连接
+        if not self._verify_connection():
+            error(f"[Watcher] Cannot start watcher for {self.kind}: connection verification failed")
+            return
+            
+        info(f"[Watcher] Starting watcher for resource kind: {self.kind}")
+        self.running = True
+        self.metrics['start_time'] = time.time()
+        self.thread = threading.Thread(target=self._watch)
+        self.thread.daemon = True
+        self.thread.start()
+        info(f"[Watcher] {self.kind} watcher thread started")
+
+    def partiallyUpdateResource(self, resource: Union[dict, str], **kwargs):
+        """
+        Partially update (PATCH) a Kubernetes resource with automatic API version detection
+        Supports both strategic merge patch and JSON merge patch
+        """
+        try:
+            resource = self._ensure_api_version(resource)
+            name = resource.get('metadata', {}).get('name')
+            
+            if not name:
+                raise ValueError("Resource must have a name")
+                
+            url = self._get_resource_url(resource, name)
+            
+            headers = {
+                'Content-Type': 'application/strategic-merge-patch+json',
+                'Accept': 'application/json'
+            }
+            
+            return createRequest(
+                url=url,
+                token=self.token,
+                method="PATCH",
+                body=json.dumps(resource),
+                headers=headers,
+                config=self.config,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"Failed to patch resource: {str(e)}")
+
+    def patchResource(self, kind: str, name: str, patch_data: dict, 
+                     namespace: str = None, patch_type: str = "strategic", **kwargs):
+        """
+        Apply a patch to a Kubernetes resource
+        
+        Args:
+            kind: Resource kind (e.g. 'Node', 'Pod')
+            name: Resource name
+            patch_data: The patch to apply
+            namespace: Resource namespace (if applicable)
+            patch_type: One of "strategic" (default), "merge", or "json"
+        """
+        try:
+            resource_info = self._get_resource_info(kind)
+            group = resource_info['group']
+            version = resource_info['version']
+            api_version = f"{group}/{version}" if group else version
+            
+            resource = {
+                'kind': kind,
+                'apiVersion': api_version,
+                'metadata': {
+                    'name': name,
+                    'namespace': namespace
+                }
+            }
+            
+            url = self._get_resource_url(resource, name)
+            
+            content_type = {
+                "strategic": "application/strategic-merge-patch+json",
+                "merge": "application/merge-patch+json",
+                "json": "application/json-patch+json"
+            }.get(patch_type, "application/strategic-merge-patch+json")
+            
+            headers = {
+                'Content-Type': content_type,
+                'Accept': 'application/json'
+            }
+            
+            return createRequest(
+                url=url,
+                token=self.token,
+                method="PATCH",
+                body=json.dumps(patch_data),
+                headers=headers,
+                config=self.config,
+                **kwargs
+            )
+        except Exception as e:
+            raise Exception(f"Failed to patch resource: {str(e)}")
+
+
+
+
+
+
+
+
+
+
+
+
+

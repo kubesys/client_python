@@ -13,34 +13,47 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  '''
-from kubesys.common import formatURL, getParams,dictToJsonString
+from kubesys.logger import logger
+from kubesys.common import formatURL, getParams, dictToJsonString
 import requests
 from requests.models import HTTPError
 from requests.exceptions import JSONDecodeError
 import json
+from kubesys.tls import tlsPaths
 
 __author__ = ('Tian Yu <yutian20@otcaix.iscas.ac.cn>',
               'Jiexin Liu <liujiexin@otcaix.scas.ac.cn>',
               'Heng Wu <wuheng@iscas.ac.cn>')
 
-from kubesys.tls import tlsPaths
-
-
 def createRequest(url, token, method="GET", body=None, verify=False,
                   keep_json=False, config=None, **kwargs):
-    response = doCreateRequest(
-        formatURL(url, getParams(kwargs)), token, method, body, config)
     try:
-        result = response.json()
-        if result.get('kind') == 'Status':
-            raise HTTPError(result.get('code'),result.get('reason')+' '+result.get('message'))
-        if keep_json:
-            result=dictToJsonString(result)
-        return result
-    except JSONDecodeError:
-        raise HTTPError(response.status_code,response.url+' '+response.reason)
+        logger.debug(f"Making request: {method} {url}")
+        response = doCreateRequest(
+            formatURL(url, getParams(kwargs)), token, method, body, config)
+        
+        try:
+            result = response.json()
+            if result.get('kind') == 'Status':
+                error_msg = f"{result.get('reason')} {result.get('message')}"
+                logger.error(f"Request failed: {error_msg}")
+                raise HTTPError(result.get('code'), error_msg)
+                
+            if keep_json:
+                result = dictToJsonString(result)
+            return result
+            
+        except JSONDecodeError:
+            error_msg = f"{response.url} {response.reason}"
+            logger.error(f"Failed to decode JSON response: {error_msg}")
+            raise HTTPError(response.status_code, error_msg)
+            
+    except Exception as e:
+        logger.error(f"Request failed: {str(e)}")
+        raise
 
 def doCreateRequest(url, token, method="GET", body=None, config=None,stream=False):
+    print(url)
     if config is None:
         response = doCreateRequestWithToken(url, token, method,stream, body)
     else:
